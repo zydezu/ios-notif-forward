@@ -11,7 +11,7 @@ use ancs::characteristics::control_point::*;
 use ancs::characteristics::data_source::*;
 use ancs::characteristics::notification_source::Notification as GattNotification;
 use btleplug::api::{
-    Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, WriteType,
+    Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
 };
 use btleplug::platform::{Manager, Peripheral};
 use futures::stream::StreamExt;
@@ -21,6 +21,9 @@ use notify_rust::{Hint, Notification, Timeout, Urgency};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::time::{Duration, Instant};
+
+const SAMPLE_IMAGE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "icons/icon-32-white.png");
+const ACTION_CLOSE: &str = "close";
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
 use tokio::sync::{oneshot, watch};
@@ -205,45 +208,45 @@ fn add_action_handlers(app: &AppGlobals, notif_id: u32, notification_uid: u32) {
     let neg_action_id = action_id_for_notif(received_notif, ActionID::Negative);
     let peripheral = app.peripheral.clone();
     let cp_char = app.cp_char.clone();
-
-    if received_notif
+    let has_ios_actions = received_notif
         .unwrap()
         .event_flags
         .contains(EventFlag::PositiveAction)
         || received_notif
             .unwrap()
             .event_flags
-            .contains(EventFlag::NegativeAction)
-    {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        std::thread::spawn(move || {
-            notify_rust::handle_action(notif_id, |result| {
-                if let notify_rust::ActionResponse::Custom(action) = result {
-                    if action == &pos_action_id || action == &neg_action_id {
-                        let req = PerformNotificationActionRequest {
-                            command_id: CommandID::PerformNotificationAction,
-                            notification_uid,
-                            action_id: if action == &pos_action_id {
-                                ActionID::Positive
-                            } else {
-                                ActionID::Negative
-                            },
-                        };
-                        let out: Vec<u8> = req.into();
-                        rt.block_on(peripheral.write(
-                            cp_char.as_ref().unwrap(),
-                            &out,
-                            WriteType::WithResponse,
-                        ))
-                        .unwrap();
-                    }
+            .contains(EventFlag::NegativeAction);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    std::thread::spawn(move || {
+        notify_rust::handle_action(notif_id, |result| {
+            if let notify_rust::ActionResponse::Custom(action) = result {
+                if has_ios_actions && (action == &pos_action_id || action == &neg_action_id) {
+                    let req = PerformNotificationActionRequest {
+                        command_id: CommandID::PerformNotificationAction,
+                        notification_uid,
+                        action_id: if action == &pos_action_id {
+                            ActionID::Positive
+                        } else {
+                            ActionID::Negative
+                        },
+                    };
+                    let out: Vec<u8> = req.into();
+                    rt.block_on(peripheral.write(
+                        cp_char.as_ref().unwrap(),
+                        &out,
+                        WriteType::WithResponse,
+                    ))
+                    .unwrap();
+                } else if *action == ACTION_CLOSE {
+                    println!("Close action clicked for notification {}", notification_uid);
                 }
-            });
+            }
         });
-    }
+    });
 }
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 fn add_action_handlers(_app: &AppGlobals, _notif_id: u32, _notification_uid: u32) {}
@@ -475,6 +478,10 @@ async fn handle_ns(app: &mut AppGlobals, value: Vec<u8>) -> Result<(), btleplug:
                 let mut send = Notification::new();
                 add_hint(&mut send, Hint::ActionIcons(true));
                 add_hint(&mut send, Hint::DesktopEntry(env!("CARGO_PKG_NAME").into()));
+                add_hint(&mut send, Hint::ImagePath(SAMPLE_IMAGE_PATH.to_string()));
+                if cfg!(all(unix, not(target_os = "macos"))) {
+                    send.action(ACTION_CLOSE, "Close");
+                }
                 let notification_uid = recv.notification_uid;
                 app.received_notifs.insert(notification_uid, recv);
                 app.pending_notifs.insert(notification_uid, send);
@@ -583,7 +590,7 @@ async fn watch_device(
 fn load_icon() -> tray_icon::Icon {
     let (icon_rgba, icon_width, icon_height) = {
         let image = image::ImageReader::with_format(
-            std::io::Cursor::new(include_bytes!("../icon-32-white.png")),
+            std::io::Cursor::new(include_bytes!("../icons/icon-32-white.png")),
             image::ImageFormat::Png,
         )
         .decode()
@@ -609,7 +616,8 @@ fn main() {
         ),
         &PredefinedMenuItem::separator(),
         &quit_item,
-    ]).unwrap();
+    ])
+    .unwrap();
     let icon_tray = load_icon();
     let mut tray_icon = Some(
         TrayIconBuilder::new()
@@ -668,8 +676,21 @@ async fn inner_main(mut quit_rx: watch::Receiver<()>) -> Result<(), Box<dyn Erro
     let central = &adapters[0];
     println!("using adapter {}", central.adapter_info().await?);
 
+    central.start_scan(ScanFilter::default()).await?;
+
     let mut tasks = tokio::task::JoinSet::new();
     let mut disconnect_txs = HashMap::new();
+
+    for peripheral in central.peripherals().await? {
+        if peripheral.is_connected().await? {
+            peripheral.discover_services().await?;
+            if peripheral.services().iter().any(|s| s.uuid == ancs::APPLE_NOTIFICATION_CENTER_SERVICE_UUID) {
+                let (disconnect_tx, disconnect_rx) = oneshot::channel();
+                disconnect_txs.insert(peripheral.id(), disconnect_tx);
+                tasks.spawn(watch_device(peripheral, quit_rx.clone(), disconnect_rx));
+            }
+        }
+    }
 
     let mut events = central.events().await?;
     loop {
